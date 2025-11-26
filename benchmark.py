@@ -5,8 +5,10 @@ Benchmark all counting strategies on FSC147.
 import json
 import torch
 import re
+import csv
 from pathlib import Path
 from PIL import Image
+from datetime import datetime
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
@@ -71,6 +73,32 @@ class AllStrategiesBenchmark:
     def dense_grid_overlap(self, image: Image.Image) -> int:
         raw = self.dense_grid(image, grid_size=6)
         return int(raw * 0.9)
+
+    def dense_grid_3x3(self, image: Image.Image) -> int:
+        return self.dense_grid(image, grid_size=3)
+
+    def dense_grid_3x3_overlap(self, image: Image.Image) -> int:
+        raw = self.dense_grid(image, grid_size=3)
+        return int(raw * 0.95)
+
+    def dense_grid_12x12(self, image: Image.Image) -> int:
+        return self.dense_grid(image, grid_size=12)
+
+    def dense_grid_12x12_overlap(self, image: Image.Image) -> int:
+        raw = self.dense_grid(image, grid_size=12)
+        return int(raw * 0.85)
+
+    def vlm_zoom(self, image: Image.Image) -> int:
+        """VLM Think-and-Zoom: Use VLM to plan regions and count in each region"""
+        obj_type, regions = self._plan_regions(image)
+
+        total = 0
+        for region in regions:
+            crop = image.crop(region["coords"])
+            count = self.direct_count(crop)
+            total += count
+
+        return total
 
     def sam3_full(self, image: Image.Image) -> int:
         obj_type = self._identify_object(image)
@@ -214,7 +242,8 @@ REGION_2: [region description]"""
         return response.strip().lower().split('.')[0].split(',')[0].strip()
 
 
-def benchmark(data_dir: str, num_samples: int = 20, split: str = "val"):
+def benchmark(data_dir: str, num_samples: int = 20, split: str = "val", output_csv: str = None,
+              only_strategies: list = None, update_csv: str = None):
     bench = AllStrategiesBenchmark()
 
     img_dir = Path(data_dir) / "images_384_VarV2"
@@ -226,21 +255,75 @@ def benchmark(data_dir: str, num_samples: int = 20, split: str = "val"):
     with open(split_file) as f:
         splits = json.load(f)
 
-    images = splits[split]
-    if num_samples > 0:
-        images = images[:num_samples]
-
-    print(f"Running on {len(images)} images from {split} split\n")
-
-    strategies = {
+    # All available strategies
+    all_strategies = {
         "Direct VLM": bench.direct_count,
+        "Dense Grid (3x3)": bench.dense_grid_3x3,
+        "Dense Grid 3x3 + Overlap": bench.dense_grid_3x3_overlap,
         "Dense Grid (6x6)": bench.dense_grid,
         "Dense Grid + Overlap": bench.dense_grid_overlap,
+        "Dense Grid (12x12)": bench.dense_grid_12x12,
+        "Dense Grid 12x12 + Overlap": bench.dense_grid_12x12_overlap,
+        "VLM Think-and-Zoom": bench.vlm_zoom,
         "SAM3 Full Image": bench.sam3_full,
         "SAM3 Think-and-Zoom": bench.sam3_zoom,
     }
 
+    # If updating existing CSV, read it and get images from there
+    existing_data = {}
+    if update_csv:
+        with open(update_csv, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                existing_data[row['image_name']] = row
+        images = list(existing_data.keys())
+        print(f"Updating {len(images)} images from existing CSV: {update_csv}\n")
+    else:
+        images = splits[split]
+        if num_samples > 0:
+            images = images[:num_samples]
+        print(f"Running on {len(images)} images from {split} split\n")
+
+    # Select strategies to run
+    if only_strategies:
+        strategies = {name: all_strategies[name] for name in only_strategies if name in all_strategies}
+        print(f"Running only: {', '.join(strategies.keys())}\n")
+    else:
+        strategies = all_strategies
+
     results = {name: [] for name in strategies}
+
+    # Create output CSV file
+    if output_csv is None:
+        if update_csv:
+            output_csv = update_csv.replace('.csv', '_updated.csv')
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_csv = f"benchmark_results_{split}_{timestamp}.csv"
+
+    csv_path = Path(output_csv)
+
+    # Determine fieldnames based on whether we're updating
+    if update_csv and existing_data:
+        # Get existing fieldnames and add new strategy columns
+        sample_row = list(existing_data.values())[0]
+        existing_fieldnames = list(sample_row.keys())
+        new_strategy_fields = []
+        for name in strategies:
+            if f"{name}_pred" not in existing_fieldnames:
+                new_strategy_fields.extend([f"{name}_pred", f"{name}_error"])
+        fieldnames = existing_fieldnames + new_strategy_fields
+    else:
+        # Create new fieldnames from scratch
+        all_strategy_names = list(all_strategies.keys())
+        fieldnames = ["image_name", "true_count"] + [f"{name}_pred" for name in all_strategy_names] + [f"{name}_error" for name in all_strategy_names]
+
+    # Write CSV header
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+
+    print(f"Saving results to: {csv_path.absolute()}\n")
 
     for i, img_name in enumerate(images):
         img_path = img_dir / img_name
@@ -252,11 +335,25 @@ def benchmark(data_dir: str, num_samples: int = 20, split: str = "val"):
 
         print(f"[{i+1}/{len(images)}] {img_name} (true={true_count})")
 
+        # Prepare row for CSV - start with existing data if updating
+        if update_csv and img_name in existing_data:
+            row = existing_data[img_name].copy()
+        else:
+            row = {"image_name": img_name, "true_count": true_count}
+
+        # Add new strategy results
         for name, method in strategies.items():
             pred = method(image)
             error = abs(pred - true_count)
             results[name].append(error)
+            row[f"{name}_pred"] = pred
+            row[f"{name}_error"] = error
             print(f"  {name}: {pred} (error={error})")
+
+        # Append to CSV after each image
+        with open(csv_path, 'a', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writerow(row)
 
     print(f"\n{'='*60}")
     print("RESULTS")
@@ -266,6 +363,8 @@ def benchmark(data_dir: str, num_samples: int = 20, split: str = "val"):
         mae = sum(results[name]) / len(results[name])
         print(f"{name:25s} MAE: {mae:.2f}")
 
+    print(f"\nDetailed results saved to: {csv_path.absolute()}")
+
 
 if __name__ == "__main__":
     import argparse
@@ -274,6 +373,10 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--num_samples", type=int, default=20, help="Number of samples (0 = all)")
     parser.add_argument("--split", type=str, default="val", choices=["val", "test"], help="Dataset split")
+    parser.add_argument("--output_csv", type=str, default=None, help="Output CSV file path (auto-generated if not specified)")
+    parser.add_argument("--update_csv", type=str, default=None, help="Update existing CSV file with new strategy results")
+    parser.add_argument("--only_strategies", type=str, nargs='+', default=None,
+                        help='Run only specific strategies (e.g., --only_strategies "Dense Grid (12x12)" "VLM Think-and-Zoom")')
 
     args = parser.parse_args()
-    benchmark(args.data_dir, args.num_samples, args.split)
+    benchmark(args.data_dir, args.num_samples, args.split, args.output_csv, args.only_strategies, args.update_csv)
